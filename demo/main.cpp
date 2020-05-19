@@ -4,7 +4,7 @@
 #include "MQTTNetwork.h"
 #include "MQTTmbed.h"
 #include "MQTTClient.h"
-
+#include "mbed_events.h"
 #define UINT14_MAX        16383
 // FXOS8700CQ I2C address
 #define FXOS8700CQ_SLAVE_ADDR0 (0x1E<<1) // with pins SA0=0, SA1=0
@@ -29,37 +29,28 @@
 I2C i2c( PTD9,PTD8);
 Serial pc(USBTX, USBRX);
 int m_addr = FXOS8700CQ_SLAVE_ADDR1;
+
+void FXOS8700CQ_readRegs(int addr, uint8_t * data, int len);
+void FXOS8700CQ_writeRegs(uint8_t * data, int len);
+
 WiFiInterface *wifi;
 InterruptIn btn2(SW2);
 InterruptIn btn3(SW3);
 volatile int message_num = 0;
 volatile int arrivedcount = 0;
 volatile bool closed = false;
+
 const char* topic = "Mbed";
+
 Thread mqtt_thread(osPriorityHigh);
 EventQueue mqtt_queue;
+Thread accThread;
 
-void FXOS8700CQ_readRegs(int addr, uint8_t * data, int len);
-void FXOS8700CQ_writeRegs(uint8_t * data, int len);
-void call();
+uint8_t who_am_i, data[2], res[6];
+int16_t acc16;
+float t[3];
 
-void call() {
-   pc.baud(115200);
-   uint8_t who_am_i, data[2], res[6];
-   int16_t acc16;
-   float t[3];
-
-   // Enable the FXOS8700Q
-   FXOS8700CQ_readRegs( FXOS8700Q_CTRL_REG1, &data[1], 1);
-   data[1] |= 0x01;
-   data[0] = FXOS8700Q_CTRL_REG1;
-   FXOS8700CQ_writeRegs(data, 2);
-
-   // Get the slave address
-   FXOS8700CQ_readRegs(FXOS8700Q_WHOAMI, &who_am_i, 1);
-
-   pc.printf("Here is %x\r\n", who_am_i);
-   while (true) {
+void acc(){
       FXOS8700CQ_readRegs(FXOS8700Q_OUT_X_MSB, res, 6);
 
       acc16 = (res[0] << 6) | (res[1] >> 2);
@@ -82,21 +73,12 @@ void call() {
             t[1], res[2], res[3],\
             t[2], res[4], res[5]\
       );
-      wait(1.0);
-   }
-}
 
-void FXOS8700CQ_readRegs(int addr, uint8_t * data, int len) {
-   char t = addr;
-   i2c.write(m_addr, &t, 1, true);
-   i2c.read(m_addr, (char *)data, len);
-}
+      wait(0.5); 
 
-void FXOS8700CQ_writeRegs(uint8_t * data, int len) {
-   i2c.write(m_addr, (char *)data, len);
 }
-
 void messageArrived(MQTT::MessageData& md) {
+
       MQTT::Message &message = md.message;
       char msg[300];
       sprintf(msg, "Message arrived: QoS%d, retained %d, dup %d, packetID %d\r\n", message.qos, message.retained, message.dup, message.id);
@@ -109,6 +91,8 @@ void messageArrived(MQTT::MessageData& md) {
 }
 
 void publish_message(MQTT::Client<MQTTNetwork, Countdown>* client) {
+      while(!closed){
+      acc();
       message_num++;
       MQTT::Message message;
       char buff[100];
@@ -119,9 +103,9 @@ void publish_message(MQTT::Client<MQTTNetwork, Countdown>* client) {
       message.payload = (void*) buff;
       message.payloadlen = strlen(buff) + 1;
       int rc = client->publish(topic, message);
-
       printf("rc:  %d\r\n", rc);
-      printf("Puslish message: %s\r\n", buff);
+      printf("Puslish message: %s\r\n", buff); 
+      }
 }
 
 void close_mqtt() {
@@ -129,6 +113,14 @@ void close_mqtt() {
 }
 
 int main() {
+      // Enable the FXOS8700Q
+      FXOS8700CQ_readRegs( FXOS8700Q_CTRL_REG1, &data[1], 1);
+      data[1] |= 0x01;
+      data[0] = FXOS8700Q_CTRL_REG1;
+      FXOS8700CQ_writeRegs(data, 2);
+      // Get the slave address
+      FXOS8700CQ_readRegs(FXOS8700Q_WHOAMI, &who_am_i, 1);
+
       wifi = WiFiInterface::get_default_instance();
       if (!wifi) {
             printf("ERROR: No WiFiInterface found.\r\n");
@@ -136,12 +128,12 @@ int main() {
       }
 
       printf("\nConnecting to %s...\r\n", MBED_CONF_APP_WIFI_SSID);
-
       int ret = wifi->connect(MBED_CONF_APP_WIFI_SSID, MBED_CONF_APP_WIFI_PASSWORD, NSAPI_SECURITY_WPA_WPA2);
       if (ret != 0) {
             printf("\nConnection error: %d\r\n", ret);
             return -1;
       }
+
 
       NetworkInterface* net = wifi;
       MQTTNetwork mqttNetwork(net);
@@ -164,7 +156,6 @@ int main() {
       if ((rc = client.connect(data)) != 0){
             printf("Fail to connect MQTT\r\n");
       }
-
       if (client.subscribe(topic, MQTT::QOS0, messageArrived) != 0){
             printf("Fail to subscribe\r\n");
       }
@@ -172,18 +163,21 @@ int main() {
       mqtt_thread.start(callback(&mqtt_queue, &EventQueue::dispatch_forever));
       btn2.rise(mqtt_queue.event(&publish_message, &client));
       btn3.rise(&close_mqtt);
+//      accThread.start(acc);
 
       int num = 0;
       while (num != 5) {
             client.yield(100);
             ++num;
       }
+
       while (1) {
             if (closed) break;
-            wait(0.5);
+      //      wait(0.5);
       }
 
       printf("Ready to close MQTT Network......\n");
+
       if ((rc = client.unsubscribe(topic)) != 0) {
             printf("Failed: rc from unsubscribe was %d\n", rc);
       }
@@ -193,5 +187,16 @@ int main() {
 
       mqttNetwork.disconnect();
       printf("Successfully closed!\n");
+
       return 0;
+}
+
+void FXOS8700CQ_readRegs(int addr, uint8_t * data, int len) {
+   char t = addr;
+   i2c.write(m_addr, &t, 1, true);
+   i2c.read(m_addr, (char *)data, len);
+}
+
+void FXOS8700CQ_writeRegs(uint8_t * data, int len) {
+   i2c.write(m_addr, (char *)data, len);
 }
